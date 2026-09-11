@@ -50,7 +50,7 @@ __device__ void keccak_f1600(uint64_t A[5][5]) {
 }
 
 __global__ void mine_kernel(
-    const uint8_t* base_input, 
+    const uint8_t* __restrict__ base_input, 
     uint64_t start_nonce, 
     uint64_t target_high, 
     uint64_t* d_found_nonce, 
@@ -61,38 +61,37 @@ __global__ void mine_kernel(
     uint64_t cur_nonce = start_nonce + tid;
 
     uint8_t input[136];
+    #pragma unroll
     for (int i = 0; i < 136; i++) input[i] = base_input[i];
 
-    // inject nonce (big-endian at bytes 20..51)
+    // inject nonce (big-endian at bytes 44..51)
+    #pragma unroll
     for (int i = 0; i < 8; i++) {
         input[44 + (7 - i)] = (uint8_t)((cur_nonce >> (i * 8)) & 0xFF);
     }
 
-    uint64_t lanes[25] = {0};
+    uint64_t A[5][5] = {0};
+    #pragma unroll
     for (int i = 0; i < 17; i++) {
         uint64_t w = 0;
+        #pragma unroll
         for (int b = 0; b < 8; b++) {
             w |= ((uint64_t)input[8 * i + b]) << (8 * b);
         }
-        lanes[i] = w;
-    }
-
-    uint64_t A[5][5];
-    for (int y = 0; y < 5; y++) {
-        for (int x = 0; x < 5; x++) {
-            A[x][y] = lanes[x + 5 * y];
-        }
+        A[i % 5][i / 5] = w;
     }
 
     keccak_f1600(A);
 
+    // Byte-swap first 64-bit word of hash to big-endian
     uint64_t h0 = A[0][0];
-    uint64_t h0_be_full = 0;
+    uint64_t h0_be = 0;
+    #pragma unroll
     for (int b = 0; b < 8; b++) {
-        h0_be_full |= ((h0 >> (8 * b)) & 0xFFULL) << (8 * (7 - b));
+        h0_be |= ((h0 >> (8 * b)) & 0xFFULL) << (8 * (7 - b));
     }
 
-    if (h0_be_full < target_high) {
+    if (h0_be < target_high) {
         *d_found = 1;
         *d_found_nonce = cur_nonce;
     }
@@ -125,34 +124,38 @@ int main(int argc, char** argv) {
     int zero = 0;
     cudaMemcpy(d_found, &zero, sizeof(int), cudaMemcpyHostToDevice);
 
-    int threads = 1024;
-    int blocks = 65536; // 67,108,864 threads per batch
+    // Optimized for maximum GPU occupancy without register spill:
+    // 256 threads per block, 4096 blocks = 1,048,576 threads per batch
+    int threads = 256;
+    int blocks = 4096;
     uint64_t batch_size = (uint64_t)threads * blocks;
-    uint64_t start_nonce = (uint64_t)time(NULL) * 1000000ULL;
+    uint64_t start_nonce = ((uint64_t)time(NULL) ^ ((uint64_t)clock() << 16)) * 100000ULL;
 
-    printf("[GPU] RTX 6000 Ada Initialized. Target: 0x%016llx\n", (unsigned long long)target_high);
-    printf("[GPU] Launching 67M threads per batch across 18,176 CUDA cores...\n");
+    printf("[GPU] CUDA Keccak-256 Initialized. Target: 0x%016llx\n", (unsigned long long)target_high);
+    printf("[GPU] Search Batch: %llu threads | Threads/Block: %d\n", (unsigned long long)batch_size, threads);
 
     int found = 0;
     uint64_t total_hashes = 0;
-    cudaEvent_t start, stop;
-    cudaEventCreate(&start);
-    cudaEventCreate(&stop);
+    clock_t t0 = clock();
 
-    cudaEventRecord(start);
     while (!found) {
         mine_kernel<<<blocks, threads>>>(d_input, start_nonce, target_high, d_found_nonce, d_found);
+        
+        cudaError_t err = cudaGetLastError();
+        if (err != cudaSuccess) {
+            printf("[FATAL] CUDA Launch Error: %s\n", cudaGetErrorString(err));
+            return 1;
+        }
+
         cudaMemcpy(&found, d_found, sizeof(int), cudaMemcpyDeviceToHost);
         start_nonce += batch_size;
         total_hashes += batch_size;
 
-        if (total_hashes % (batch_size * 10) == 0) {
-            cudaEventRecord(stop);
-            cudaEventSynchronize(stop);
-            float ms = 0;
-            cudaEventElapsedTime(&ms, start, stop);
-            double mhs = (total_hashes / (ms / 1000.0)) / 1000000.0;
-            printf("[GPU] Speed: %.1f MH/s | Total Hashes: %llu\n", mhs, (unsigned long long)total_hashes);
+        if (total_hashes % (batch_size * 50) == 0) {
+            clock_t t1 = clock();
+            double sec = (double)(t1 - t0) / CLOCKS_PER_SEC;
+            double mhs = (total_hashes / (sec > 0 ? sec : 0.001)) / 1000000.0;
+            printf("[GPU] Real Speed: %.1f MH/s | Hashes: %llu\n", mhs, (unsigned long long)total_hashes);
         }
     }
 
