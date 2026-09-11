@@ -70,6 +70,9 @@ print("🐱 HASHCATS HIGH-SPEED PRO MINER (MULTI-GPU + DEDICATED RPC)")
 print(f"Target Wallet: {wallet}")
 print(f"GPUs Detected: {gpu_count} GPU(s)")
 print(f"Primary RPC:   Alchemy Dedicated High-Speed Node")
+live_price_res = call_rpc("0x6817c76c")
+live_price_eth = (int(live_price_res, 16) / 1e18) if live_price_res else 0.02032
+print(f"Mint Price:    {live_price_eth:.5f} ETH (Dynamic On-Chain)")
 print(f"Mode:          {'🚀 AUTO-MINT ENABLED (Multi-RPC Parallel Broadcast)' if auto_mint else '📝 MANUAL CLAIM'}")
 print("="*65)
 
@@ -112,10 +115,15 @@ def send_mint_tx(winning_nonce, anchor_block):
     # 3. Payload: mine(uint256 nonce, uint256 anchorBlock)
     tx_data = f"0x071e9503{int(winning_nonce):064x}{int(anchor_block):064x}"
 
+    # 4. Fetch dynamic mint price from contract
+    mint_price_res = call_rpc("0x6817c76c") # mintPrice()
+    mint_price_wei = int(mint_price_res, 16) if mint_price_res else 20320000000000000
+    print(f"[MINT] Current On-Chain Price: {mint_price_wei / 1e18:.5f} ETH")
+
     # 4. Sign raw tx
     tx_dict = {
         "to": CONTRACT,
-        "value": 10080000000000000, # 0.01008 ETH
+        "value": mint_price_wei,
         "gas": 450000,
         "gasPrice": fast_gas,
         "nonce": tx_count,
