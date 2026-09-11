@@ -26,32 +26,23 @@ __constant__ int r[5][5] = {
 
 #define ROTL64(x, y) (((x) << (y)) | ((x) >> (64 - (y))))
 
-__device__ __forceinline__ void keccak_f1600(uint64_t A[5][5]) {
-    #pragma unroll 24
+__device__ void keccak_f1600(uint64_t A[5][5]) {
     for (int round_idx = 0; round_idx < 24; round_idx++) {
         uint64_t C[5], D[5];
-        #pragma unroll
         for (int x = 0; x < 5; x++)
             C[x] = A[x][0] ^ A[x][1] ^ A[x][2] ^ A[x][3] ^ A[x][4];
-        #pragma unroll
         for (int x = 0; x < 5; x++)
             D[x] = C[(x + 4) % 5] ^ ROTL64(C[(x + 1) % 5], 1);
-        #pragma unroll
         for (int x = 0; x < 5; x++)
-            #pragma unroll
             for (int y = 0; y < 5; y++)
                 A[x][y] ^= D[x];
 
         uint64_t B[5][5];
-        #pragma unroll
         for (int x = 0; x < 5; x++)
-            #pragma unroll
             for (int y = 0; y < 5; y++)
                 B[y][(2 * x + 3 * y) % 5] = ROTL64(A[x][y], r[x][y]);
 
-        #pragma unroll
         for (int x = 0; x < 5; x++)
-            #pragma unroll
             for (int y = 0; y < 5; y++)
                 A[x][y] = B[x][y] ^ ((~B[(x + 1) % 5][y]) & B[(x + 2) % 5][y]);
 
@@ -59,7 +50,7 @@ __device__ __forceinline__ void keccak_f1600(uint64_t A[5][5]) {
     }
 }
 
-__global__ void mine_kernel(
+__global__ __launch_bounds__(256, 4) void mine_kernel(
     const uint8_t* __restrict__ base_input, 
     uint64_t start_nonce, 
     uint64_t target_high, 
@@ -145,16 +136,13 @@ int main(int argc, char** argv) {
     int zero = 0;
     cudaMemcpy(d_found, &zero, sizeof(int), cudaMemcpyHostToDevice);
 
-    // Optimized for maximum GPU occupancy on RTX 4090 / RTX 5090 / RTX 6000 Ada:
+    // Optimized configuration: 256 threads, 4096 blocks = 1,048,576 threads
     int threads = 256;
-    int blocks = 8192; // 2,097,152 threads per batch
+    int blocks = 4096;
     uint64_t batch_size = (uint64_t)threads * blocks;
     
     // Seed start nonce with custom offset + random entropy
     uint64_t start_nonce = nonce_offset + (((uint64_t)time(NULL) ^ ((uint64_t)clock() << 16)) * 100000ULL);
-
-    printf("[GPU %d] Keccak Engine Initialized | Target: 0x%016llx\n", gpu_id, (unsigned long long)target_high);
-    printf("[GPU %d] Batch Size: %llu threads | Blocks: %d | Threads/Block: %d\n", gpu_id, (unsigned long long)batch_size, blocks, threads);
 
     int found = 0;
     uint64_t total_hashes = 0;
@@ -173,7 +161,7 @@ int main(int argc, char** argv) {
         start_nonce += batch_size;
         total_hashes += batch_size;
 
-        if (total_hashes % (batch_size * 25) == 0) {
+        if (total_hashes % (batch_size * 50) == 0) {
             clock_t t1 = clock();
             double sec = (double)(t1 - t0) / CLOCKS_PER_SEC;
             double mhs = (total_hashes / (sec > 0 ? sec : 0.001)) / 1000000.0;
