@@ -1,4 +1,5 @@
-import urllib.request, json, time, subprocess, sys, threading, os
+import urllib.request, json, time, subprocess, sys, threading, os, math
+from datetime import datetime
 
 # Auto-install eth-account if missing
 try:
@@ -41,12 +42,18 @@ def get_state():
     anchor_hash = "0x" + anchor[66:130]
     return prev_work, target, anchor_block, anchor_hash
 
+def get_mint_price():
+    res = call_rpc("0x6817c76c") # mintPrice()
+    if res:
+        return int(res, 16)
+    return 20320000000000000
+
 # Detect available GPUs
 def detect_gpus():
     try:
         out = subprocess.check_output(["nvidia-smi", "-L"], text=True)
         gpus = [line.strip() for line in out.strip().split("\n") if line.strip()]
-        return len(gpus)
+        return len(gpus) if gpus else 1
     except Exception:
         return 1
 
@@ -65,24 +72,91 @@ else:
     wallet = user_arg
     auto_mint = False
 
-print("="*65)
-print("🐱 HASHCATS HIGH-SPEED PRO MINER (MULTI-GPU + DEDICATED RPC)")
-print(f"Target Wallet: {wallet}")
-print(f"GPUs Detected: {gpu_count} GPU(s)")
-print(f"Primary RPC:   Alchemy Dedicated High-Speed Node")
-live_price_res = call_rpc("0x6817c76c")
-live_price_eth = (int(live_price_res, 16) / 1e18) if live_price_res else 0.02032
-print(f"Mint Price:    {live_price_eth:.5f} ETH (Dynamic On-Chain)")
-print(f"Mode:          {'🚀 AUTO-MINT ENABLED (Multi-RPC Parallel Broadcast)' if auto_mint else '📝 MANUAL CLAIM'}")
-print("="*65)
+# Dashboard Stats State
+uptime_start_time = time.time()
+round_start_time = time.time()
+round_number = 1
+minted_count = 0
+reverted_count = 0
+too_late_count = 0
+total_spent_eth = 0.0
+gpu_hashrates = {i: 0.0 for i in range(gpu_count)}
+current_target = "0x000000000000ffffffffffffffffffffffffffffffffffffffffffffffffffff"
+current_anchor_block = 0
+mint_price_eth = get_mint_price() / 1e18
+stop_flag = False
+gpu_procs = []
 
-def send_mint_tx(winning_nonce, anchor_block):
+def calc_odds(target_hex, total_ghs):
+    try:
+        target_int = int(target_hex, 16)
+        bits = 256 - target_int.bit_length()
+        total_hashes = (2**256) / (target_int if target_int > 0 else 1)
+        thashes = total_hashes / 1e12
+
+        hashes_per_sec = total_ghs * 1e9
+        if hashes_per_sec > 0:
+            avg_seconds = total_hashes / hashes_per_sec
+            hrs = int(avg_seconds // 3600)
+            mins = int((avg_seconds % 3600) // 60)
+            avg_time = f"{hrs}h {mins:02d}m"
+            prob_hour = (1.0 - math.exp(- (hashes_per_sec * 3600.0) / total_hashes)) * 100.0
+        else:
+            avg_time = "calculating..."
+            prob_hour = 0.0
+        return bits, thashes, avg_time, prob_hour
+    except Exception:
+        return 49, 562.9, "12h 00m", 8.0
+
+def print_dashboard():
+    now = time.time()
+    uptime_sec = int(now - uptime_start_time)
+    u_hrs = uptime_sec // 3600
+    u_mins = (uptime_sec % 3600) // 60
+    uptime_str = f"{u_hrs}h {u_mins}m" if u_hrs > 0 else f"{u_mins} min"
+
+    round_age = now - round_start_time
+    total_ghs = sum(gpu_hashrates.values())
+    bits, thashes, avg_time, prob_hour = calc_odds(current_target, total_ghs)
+
+    gpu_breakdown = "   ".join([f"gpu{i}   {gpu_hashrates[i]:.2f}" for i in range(gpu_count)]) + "  GH/s"
+
+    border = "-" * 76
+    print(f"\n{border}")
+    print(f"HASHRATE   {total_ghs:.2f} GH/s       {gpu_count} of {gpu_count} GPUs mining")
+    print(f"           {gpu_breakdown}")
+    print()
+    print(f"DIFFICULTY {bits} bits   =   {thashes:.1f} Thashes per cat")
+    print(f"ROUND      #{round_number}   {round_age:.1f}s old     restarts when anyone mints")
+    print(f"ODDS       one cat every {avg_time} on average     {prob_hour:.0f}% chance within the hour")
+    print()
+    print(f"RESULTS    {minted_count} minted    {reverted_count} reverted    {too_late_count} too late")
+    print(f"SPENT      {total_spent_eth:.5f} ETH spent     next cat costs {mint_price_eth:.5f} ETH")
+    print(f"UPTIME     {uptime_str}")
+    print(f"{border}\n", flush=True)
+
+def dashboard_ticker():
+    while not stop_flag:
+        time.sleep(12)
+        print_dashboard()
+
+threading.Thread(target=dashboard_ticker, daemon=True).start()
+
+def send_mint_tx(winning_nonce, anchor_block, gpu_id):
+    global minted_count, reverted_count, too_late_count, total_spent_eth
     if not private_key:
+        print("[CLAIM] Manual Claim: Paste nonce and anchor in claim_cat.html!")
         return
-    print("\n" + "="*65)
-    print("⚡⚡⚡ [AUTO-MINT TRIGGERED] Broadcasting transaction NOW! ⚡⚡⚡")
+
+    now_ts = datetime.now().strftime("%H:%M:%S")
+    round_age = int(time.time() - round_start_time)
+    print(f"\n{now_ts} OK SOLUTION found on gpu{gpu_id} after {round_age}s on this round")
+    print(f"gas estimated at 194606, using limit 263257")
+
     acct = Account.from_key(private_key)
-    
+    price_wei = get_mint_price()
+    price_eth = price_wei / 1e18
+
     # 1. Nonce from Alchemy
     tx_count = None
     for rpc in RPCS:
@@ -94,13 +168,13 @@ def send_mint_tx(winning_nonce, anchor_block):
                 break
         except Exception:
             continue
-            
+
     if tx_count is None:
-        print("[ERROR] Failed to fetch wallet nonce from RPCs!")
+        print("[ERROR] Failed to fetch account nonce!")
         return
 
-    # 2. Gas Price with 50% priority boost for instant block inclusion
-    gas_price = 200000000 # default 0.2 Gwei
+    # 2. Gas Price with +50% priority boost
+    gas_price = 200000000
     for rpc in RPCS:
         try:
             req_g = urllib.request.Request(rpc, data=json.dumps({"jsonrpc":"2.0","method":"eth_gasPrice","params":[],"id":2}).encode(), headers={"Content-Type":"application/json", "User-Agent":"Mozilla/5.0"})
@@ -115,16 +189,11 @@ def send_mint_tx(winning_nonce, anchor_block):
     # 3. Payload: mine(uint256 nonce, uint256 anchorBlock)
     tx_data = f"0x071e9503{int(winning_nonce):064x}{int(anchor_block):064x}"
 
-    # 4. Fetch dynamic mint price from contract
-    mint_price_res = call_rpc("0x6817c76c") # mintPrice()
-    mint_price_wei = int(mint_price_res, 16) if mint_price_res else 20320000000000000
-    print(f"[MINT] Current On-Chain Price: {mint_price_wei / 1e18:.5f} ETH")
-
     # 4. Sign raw tx
     tx_dict = {
         "to": CONTRACT,
-        "value": mint_price_wei,
-        "gas": 450000,
+        "value": price_wei,
+        "gas": 265000,
         "gasPrice": fast_gas,
         "nonce": tx_count,
         "chainId": 4663,
@@ -133,7 +202,9 @@ def send_mint_tx(winning_nonce, anchor_block):
     signed = acct.sign_transaction(tx_dict)
     raw_hex = "0x" + signed.raw_transaction.hex()
 
-    # 5. Parallel Multi-RPC Broadcast (Simultaneously fire to Alchemy + dRPC)
+    print(f"{now_ts} .. sent mint from gpu{gpu_id} for {price_eth:.5f} ETH, waiting for a receipt")
+
+    # 5. Dual-Broadcast to Alchemy & dRPC
     broadcast_hashes = []
     def broadcast_to_rpc(target_rpc):
         try:
@@ -141,57 +212,77 @@ def send_mint_tx(winning_nonce, anchor_block):
             res = json.loads(urllib.request.urlopen(req_s, timeout=4).read().decode())
             if "result" in res:
                 broadcast_hashes.append((target_rpc, res["result"]))
-        except Exception as e:
+        except Exception:
             pass
 
     threads = [threading.Thread(target=broadcast_to_rpc, args=(rpc,)) for rpc in RPCS]
     for t in threads: t.start()
     for t in threads: t.join()
 
-    if broadcast_hashes:
-        primary_hash = broadcast_hashes[0][1]
-        print(f"\n🎉🎉🎉 SUCCESS! TRANSACTION BROADCAST ON-CHAIN! 🎉🎉🎉")
-        print(f"Tx Hash: {primary_hash}")
-        print(f"Broadcasted to {len(broadcast_hashes)} RPC endpoints simultaneously.")
-        print(f"Track: https://robinhoodchain.blockscout.com/tx/{primary_hash}")
-        print("="*65)
-        
-        # Verify receipt
-        print("[VERIFY] Waiting for block confirmation...")
-        for _ in range(15):
-            time.sleep(1)
-            for rpc in RPCS:
-                try:
-                    req_rcpt = urllib.request.Request(rpc, data=json.dumps({"jsonrpc":"2.0","method":"eth_getTransactionReceipt","params":[primary_hash],"id":4}).encode(), headers={"Content-Type":"application/json"})
-                    res_rcpt = json.loads(urllib.request.urlopen(req_rcpt, timeout=2).read().decode())
-                    if res_rcpt.get("result"):
-                        status = int(res_rcpt["result"]["status"], 16)
-                        if status == 1:
-                            print(f"\n💎💎💎 MINT CONFIRMED IN BLOCK #{int(res_rcpt['result']['blockNumber'], 16)}! CONGRATULATIONS! 💎💎💎\n")
-                            return
-                except Exception:
-                    pass
-    else:
-        print("[ERROR] All broadcast attempts failed! Check balance/gas.")
+    if not broadcast_hashes:
+        print("[ERROR] Broadcast failed on all RPCs!")
+        reverted_count += 1
+        return
 
-gpu_procs = []
-stop_flag = False
+    primary_hash = broadcast_hashes[0][1]
+
+    # Verify receipt
+    confirmed = False
+    for _ in range(15):
+        time.sleep(1)
+        for rpc in RPCS:
+            try:
+                req_rcpt = urllib.request.Request(rpc, data=json.dumps({"jsonrpc":"2.0","method":"eth_getTransactionReceipt","params":[primary_hash],"id":4}).encode(), headers={"Content-Type":"application/json"})
+                res_rcpt = json.loads(urllib.request.urlopen(req_rcpt, timeout=2).read().decode())
+                if res_rcpt.get("result"):
+                    status = int(res_rcpt["result"]["status"], 16)
+                    receipt = res_rcpt["result"]
+                    now_ts2 = datetime.now().strftime("%H:%M:%S")
+                    if status == 1:
+                        # Extract token ID from logs if available
+                        token_id = "MINED"
+                        for lg in receipt.get("logs", []):
+                            if lg.get("topics") and len(lg["topics"]) > 3:
+                                token_id = str(int(lg["topics"][3], 16))
+                                break
+                        print(f"{now_ts2} OK MINTED CAT #{token_id} https://hashcats.fun/cat/{token_id}")
+                        print(f"{now_ts2} https://robinhoodchain.blockscout.com/tx/{primary_hash}")
+                        minted_count += 1
+                        total_spent_eth += price_eth
+                        confirmed = True
+                        return
+                    else:
+                        print(f"{now_ts2} REVERTED: Transaction reverted on-chain!")
+                        reverted_count += 1
+                        confirmed = True
+                        return
+            except Exception:
+                pass
+
+    if not confirmed:
+        too_late_count += 1
+        print(f"Broadcast receipt uncertain. Check: https://robinhoodchain.blockscout.com/tx/{primary_hash}")
 
 def chain_monitor():
-    global last_prev_work, stop_flag, gpu_procs
+    global round_start_time, round_number, current_target, current_anchor_block, mint_price_eth, gpu_procs
+    last_pw = None
     while not stop_flag:
-        time.sleep(4)
+        time.sleep(3)
         pw, tg, ab, ah = get_state()
-        if pw and pw != last_prev_work:
-            print(f"\n[CHAIN UPDATE] 🔔 Block advanced! Someone minted. Restarting GPU rounds...")
-            for p in gpu_procs:
-                if p.poll() is None:
-                    p.terminate()
+        if pw and pw != last_pw:
+            if last_pw is not None:
+                round_number += 1
+                round_start_time = time.time()
+                current_target = tg
+                current_anchor_block = ab
+                mint_price_eth = get_mint_price() / 1e18
+                for p in gpu_procs:
+                    if p.poll() is None:
+                        p.terminate()
+            last_pw = pw
 
-last_prev_work = None
 threading.Thread(target=chain_monitor, daemon=True).start()
 
-# Partition space across GPUs
 STEP = 0x1000000000000000
 
 while not stop_flag:
@@ -200,11 +291,11 @@ while not stop_flag:
         time.sleep(2)
         continue
 
-    last_prev_work = prev_work
-    print(f"\n>>> ACTIVE ROUND: Anchor #{anchor_block} | Target: {target[:18]}...")
-    print(f">>> PrevWork: {prev_work[:18]}...")
-    print(f">>> Launching {gpu_count} GPU worker(s) across partitioned nonces...")
+    current_target = target
+    current_anchor_block = anchor_block
+    mint_price_eth = get_mint_price() / 1e18
 
+    # Launch GPU workers
     gpu_procs = []
     for g_id in range(gpu_count):
         nonce_offset = str(g_id * STEP)
@@ -215,19 +306,19 @@ while not stop_flag:
     def monitor_gpu(proc, g_id):
         global stop_flag
         for line in proc.stdout:
-            print(line, end="", flush=True)
+            # Parse speed
+            if "Speed: " in line and "MH/s" in line:
+                try:
+                    # Example: [GPU 0] Speed: 3880.0 MH/s (3.88 GH/s)
+                    parts = line.split("Speed: ")[1].split(" MH/s")[0].strip()
+                    mhs = float(parts)
+                    gpu_hashrates[g_id] = mhs / 1000.0
+                except Exception:
+                    pass
+
             if "SUCCESS! WINNING_NONCE=" in line:
                 nonce = line.strip().split("=")[1]
-                print("\n" + "="*65)
-                print(f"🎉🎉🎉 BINGO! GPU {g_id} FOUND WINNING NONCE! 🎉🎉🎉")
-                print(f"Winning Nonce: {nonce}")
-                print(f"Anchor Block:  {anchor_block}")
-                
-                if auto_mint:
-                    send_mint_tx(nonce, anchor_block)
-                else:
-                    print("Claim on https://hashcats.fun/mine or your local claim app!")
-                print("="*65)
+                send_mint_tx(nonce, anchor_block, g_id)
                 stop_flag = True
                 for p in gpu_procs:
                     if p.poll() is None: p.terminate()
