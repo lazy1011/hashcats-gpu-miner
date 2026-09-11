@@ -50,7 +50,7 @@ __device__ void keccak_f1600(uint64_t A[5][5]) {
     }
 }
 
-__global__ __launch_bounds__(256, 4) void mine_kernel(
+__global__ void mine_kernel(
     const uint8_t* __restrict__ base_input, 
     uint64_t start_nonce, 
     uint64_t target_high, 
@@ -136,12 +136,10 @@ int main(int argc, char** argv) {
     int zero = 0;
     cudaMemcpy(d_found, &zero, sizeof(int), cudaMemcpyHostToDevice);
 
-    // Optimized configuration: 256 threads, 4096 blocks = 1,048,576 threads
+    // EXACT configuration from 01aa8f4 (hit 4.39 GH/s on 5090 and 2.97 GH/s on Ada):
     int threads = 256;
     int blocks = 4096;
     uint64_t batch_size = (uint64_t)threads * blocks;
-    
-    // Seed start nonce with custom offset + random entropy
     uint64_t start_nonce = nonce_offset + (((uint64_t)time(NULL) ^ ((uint64_t)clock() << 16)) * 100000ULL);
 
     int found = 0;
