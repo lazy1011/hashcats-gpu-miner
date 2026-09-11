@@ -162,6 +162,12 @@ def send_mint_tx(winning_nonce, anchor_block, gpu_id):
     price_wei = get_mint_price()
     price_eth = price_wei / 1e18
 
+    # Safety Cap: Max 0.05 ETH mint price
+    MAX_PRICE_CAP = 0.05 * 1e18
+    if price_wei > MAX_PRICE_CAP:
+        print(f"[SAFETY REJECT] Price {price_eth:.5f} ETH exceeds 0.05 ETH safety cap! Skipping mint.")
+        return
+
     # 1. Nonce from Alchemy
     tx_count = None
     for rpc in RPCS:
@@ -190,6 +196,10 @@ def send_mint_tx(winning_nonce, anchor_block, gpu_id):
         except Exception:
             continue
     fast_gas = int(gas_price * 1.50)
+    GAS_LIMIT = 350000
+    MAX_GAS_FEE = int(0.0007 * 1e18) # 0.0007 ETH max gas budget
+    if (fast_gas * GAS_LIMIT) > MAX_GAS_FEE:
+        fast_gas = int(MAX_GAS_FEE / GAS_LIMIT)
 
     # 3. Payload: mine(uint256 nonce, uint256 anchorBlock)
     tx_data = f"0x071e9503{int(winning_nonce):064x}{int(anchor_block):064x}"
@@ -198,7 +208,7 @@ def send_mint_tx(winning_nonce, anchor_block, gpu_id):
     tx_dict = {
         "to": CONTRACT,
         "value": price_wei,
-        "gas": 265000,
+        "gas": GAS_LIMIT,
         "gasPrice": fast_gas,
         "nonce": tx_count,
         "chainId": 4663,
@@ -244,13 +254,24 @@ def send_mint_tx(winning_nonce, anchor_block, gpu_id):
                     receipt = res_rcpt["result"]
                     now_ts2 = datetime.now().strftime("%H:%M:%S")
                     if status == 1:
-                        # Extract token ID from logs if available
                         token_id = "MINED"
+                        event_verified = False
+                        wallet_clean = acct.address.lower().replace("0x", "")
                         for lg in receipt.get("logs", []):
-                            if lg.get("topics") and len(lg["topics"]) > 3:
-                                token_id = str(int(lg["topics"][3], 16))
-                                break
-                        print(f"{now_ts2} OK MINTED CAT #{token_id} https://hashcats.fun/cat/{token_id}")
+                            topics = lg.get("topics", [])
+                            if len(topics) >= 4 and topics[0].startswith("0xddf252ad"):
+                                # Verify recipient matches wallet
+                                if wallet_clean in topics[2].lower():
+                                    token_id = str(int(topics[3], 16))
+                                    event_verified = True
+                                    break
+                                elif len(topics) > 3:
+                                    token_id = str(int(topics[3], 16))
+
+                        if event_verified:
+                            print(f"{now_ts2} OK MINTED CAT #{token_id} (Transfer verified on-chain to {acct.address[:10]}...) https://hashcats.fun/cat/{token_id}")
+                        else:
+                            print(f"{now_ts2} OK MINTED CAT #{token_id} https://hashcats.fun/cat/{token_id}")
                         print(f"{now_ts2} https://robinhoodchain.blockscout.com/tx/{primary_hash}")
                         minted_count += 1
                         total_spent_eth += price_eth
