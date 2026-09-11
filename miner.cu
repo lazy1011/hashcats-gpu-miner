@@ -2,6 +2,7 @@
 #include <stdint.h>
 #include <string.h>
 #include <time.h>
+#include <stdlib.h>
 #include <cuda_runtime.h>
 
 __constant__ uint64_t RC[24] = {
@@ -25,23 +26,32 @@ __constant__ int r[5][5] = {
 
 #define ROTL64(x, y) (((x) << (y)) | ((x) >> (64 - (y))))
 
-__device__ void keccak_f1600(uint64_t A[5][5]) {
+__device__ __forceinline__ void keccak_f1600(uint64_t A[5][5]) {
+    #pragma unroll 24
     for (int round_idx = 0; round_idx < 24; round_idx++) {
         uint64_t C[5], D[5];
+        #pragma unroll
         for (int x = 0; x < 5; x++)
             C[x] = A[x][0] ^ A[x][1] ^ A[x][2] ^ A[x][3] ^ A[x][4];
+        #pragma unroll
         for (int x = 0; x < 5; x++)
             D[x] = C[(x + 4) % 5] ^ ROTL64(C[(x + 1) % 5], 1);
+        #pragma unroll
         for (int x = 0; x < 5; x++)
+            #pragma unroll
             for (int y = 0; y < 5; y++)
                 A[x][y] ^= D[x];
 
         uint64_t B[5][5];
+        #pragma unroll
         for (int x = 0; x < 5; x++)
+            #pragma unroll
             for (int y = 0; y < 5; y++)
                 B[y][(2 * x + 3 * y) % 5] = ROTL64(A[x][y], r[x][y]);
 
+        #pragma unroll
         for (int x = 0; x < 5; x++)
+            #pragma unroll
             for (int y = 0; y < 5; y++)
                 A[x][y] = B[x][y] ^ ((~B[(x + 1) % 5][y]) & B[(x + 2) % 5][y]);
 
@@ -99,8 +109,19 @@ __global__ void mine_kernel(
 
 int main(int argc, char** argv) {
     if (argc < 5) {
-        printf("Usage: ./miner <wallet_hex> <prev_work_hex> <anchor_hash_hex> <target_hex>\n");
+        printf("Usage: ./miner <wallet_hex> <prev_work_hex> <anchor_hash_hex> <target_hex> [gpu_id] [nonce_offset]\n");
         return 1;
+    }
+
+    int gpu_id = 0;
+    if (argc > 5) {
+        gpu_id = atoi(argv[5]);
+    }
+    cudaSetDevice(gpu_id);
+
+    uint64_t nonce_offset = 0;
+    if (argc > 6) {
+        sscanf(argv[6], "%llu", (unsigned long long*)&nonce_offset);
     }
 
     uint8_t base_input[136] = {0};
@@ -124,15 +145,16 @@ int main(int argc, char** argv) {
     int zero = 0;
     cudaMemcpy(d_found, &zero, sizeof(int), cudaMemcpyHostToDevice);
 
-    // Optimized for maximum GPU occupancy without register spill:
-    // 256 threads per block, 4096 blocks = 1,048,576 threads per batch
+    // Optimized for maximum GPU occupancy on RTX 4090 / RTX 5090 / RTX 6000 Ada:
     int threads = 256;
-    int blocks = 4096;
+    int blocks = 8192; // 2,097,152 threads per batch
     uint64_t batch_size = (uint64_t)threads * blocks;
-    uint64_t start_nonce = ((uint64_t)time(NULL) ^ ((uint64_t)clock() << 16)) * 100000ULL;
+    
+    // Seed start nonce with custom offset + random entropy
+    uint64_t start_nonce = nonce_offset + (((uint64_t)time(NULL) ^ ((uint64_t)clock() << 16)) * 100000ULL);
 
-    printf("[GPU] CUDA Keccak-256 Initialized. Target: 0x%016llx\n", (unsigned long long)target_high);
-    printf("[GPU] Search Batch: %llu threads | Threads/Block: %d\n", (unsigned long long)batch_size, threads);
+    printf("[GPU %d] Keccak Engine Initialized | Target: 0x%016llx\n", gpu_id, (unsigned long long)target_high);
+    printf("[GPU %d] Batch Size: %llu threads | Blocks: %d | Threads/Block: %d\n", gpu_id, (unsigned long long)batch_size, blocks, threads);
 
     int found = 0;
     uint64_t total_hashes = 0;
@@ -143,7 +165,7 @@ int main(int argc, char** argv) {
         
         cudaError_t err = cudaGetLastError();
         if (err != cudaSuccess) {
-            printf("[FATAL] CUDA Launch Error: %s\n", cudaGetErrorString(err));
+            printf("[FATAL] CUDA Launch Error on GPU %d: %s\n", gpu_id, cudaGetErrorString(err));
             return 1;
         }
 
@@ -151,11 +173,11 @@ int main(int argc, char** argv) {
         start_nonce += batch_size;
         total_hashes += batch_size;
 
-        if (total_hashes % (batch_size * 50) == 0) {
+        if (total_hashes % (batch_size * 25) == 0) {
             clock_t t1 = clock();
             double sec = (double)(t1 - t0) / CLOCKS_PER_SEC;
             double mhs = (total_hashes / (sec > 0 ? sec : 0.001)) / 1000000.0;
-            printf("[GPU] Real Speed: %.1f MH/s | Hashes: %llu\n", mhs, (unsigned long long)total_hashes);
+            printf("[GPU %d] Speed: %.1f MH/s (%.2f GH/s) | Total Hashes: %llu\n", gpu_id, mhs, mhs / 1000.0, (unsigned long long)total_hashes);
         }
     }
 
