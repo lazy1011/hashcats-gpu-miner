@@ -1,5 +1,10 @@
 import urllib.request, json, time, subprocess, sys, threading, os, math
 from datetime import datetime
+import signal
+try:
+    signal.signal(signal.SIGHUP, signal.SIG_IGN)
+except Exception:
+    pass
 
 # Auto-install eth-account if missing
 try:
@@ -279,6 +284,10 @@ def chain_monitor():
                 for p in gpu_procs:
                     if p.poll() is None:
                         p.terminate()
+                        try:
+                            p.wait(timeout=1)
+                        except Exception:
+                            p.kill()
             last_pw = pw
 
 threading.Thread(target=chain_monitor, daemon=True).start()
@@ -327,3 +336,9 @@ while not stop_flag:
     threads = [threading.Thread(target=monitor_gpu, args=(p, i)) for i, p in enumerate(gpu_procs)]
     for t in threads: t.start()
     for t in threads: t.join()
+    for p in gpu_procs:
+        try:
+            if p.stdout: p.stdout.close()
+            p.wait(timeout=0.5)
+        except Exception:
+            pass
