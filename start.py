@@ -17,8 +17,8 @@ except ImportError:
 # Primary: User Dedicated Alchemy RPC (Sub-50ms latency)
 # Secondary: dRPC Fallback
 RPCS = [
-    "https://robinhood-mainnet.g.alchemy.com/v2/2mLwK8sr1SFmCGYugLzKPkrpEu0c5-s4",
-    "https://robinhood.drpc.org"
+    "https://robinhood.drpc.org",
+    "https://rpc.mainnet.chain.robinhood.com"
 ]
 CONTRACT = "0xCA75DF55Cc9C476DB27a7375D1fc8E794cf80721"
 
@@ -163,9 +163,9 @@ def send_mint_tx(winning_nonce, anchor_block, gpu_id):
     price_eth = price_wei / 1e18
 
     # Safety Cap: Max 0.05 ETH mint price
-    MAX_PRICE_CAP = 0.05 * 1e18
+    MAX_PRICE_CAP = 0.10 * 1e18
     if price_wei > MAX_PRICE_CAP:
-        print(f"[SAFETY REJECT] Price {price_eth:.5f} ETH exceeds 0.05 ETH safety cap! Skipping mint.")
+        print(f"[SAFETY REJECT] Price {price_eth:.5f} ETH exceeds 0.10 ETH safety cap! Skipping mint.")
         return
 
     # 1. Nonce from Alchemy
